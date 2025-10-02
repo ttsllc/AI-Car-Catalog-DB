@@ -1,0 +1,5 @@
+{
+  "name": "Car Catalog Data Extractor",
+  "description": "An application to upload a car catalog PDF, extract vehicle specifications using AI, and export the structured data.",
+  "requestFramePermissions": []
+}
