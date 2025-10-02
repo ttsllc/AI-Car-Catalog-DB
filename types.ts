@@ -1,3 +1,6 @@
+
+import { Chat } from '@google/genai';
+
 export interface CarSpecification {
   id: string;
   manufacturer: string | null;
@@ -25,4 +28,6 @@ export interface CatalogRecord {
   extractedData: CarSpecification[];
   rawJson: string;
   rawText: string;
+  summary?: string;
+  images?: string[];
 }

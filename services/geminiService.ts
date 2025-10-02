@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
 import { CarSpecification } from '../types';
 
@@ -34,6 +35,9 @@ const carDataSchema = {
   },
 };
 
+/**
+ * Wraps a promise with a timeout.
+ */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -50,6 +54,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
         reject(reason);
       });
   });
+}
+
+/**
+ * Handles errors from the Gemini API and returns a user-friendly Error object.
+ * @param error The error caught from the API call.
+ * @param context A string describing the context of the API call (e.g., 'データ抽出').
+ * @returns An Error object with a user-friendly message.
+ */
+function handleGeminiError(error: any, context: string): Error {
+  console.error(`Error during Gemini API call (${context}):`, error);
+
+  if (error instanceof Error) {
+    const errorMessage = error.message.toLowerCase();
+    
+    if (errorMessage.includes("api key not valid") || errorMessage.includes("api_key_invalid")) {
+      return new Error("APIキーが無効か、設定されていません。環境変数を確認してください。");
+    }
+    if (errorMessage.includes("rate limit") || errorMessage.includes("resource_exhausted") || errorMessage.includes("429")) {
+      return new Error(`APIの利用回数制限を超えました。しばらく待ってから再度お試しください。(コンテキスト: ${context})`);
+    }
+    if (errorMessage.includes("billing") || errorMessage.includes("project_disabled")) {
+        return new Error("Google Cloudプロジェクトの課金設定に問題がある可能性があります。設定を確認してください。");
+    }
+    if (errorMessage.includes("timed out")) {
+      return new Error(`AIによる${context}がタイムアウトしました。カタログが大きすぎるか、複雑すぎる可能性があります。`);
+    }
+    // Return a more generic but still informative error from the original message
+    return new Error(`AIによる${context}中にエラーが発生しました: ${error.message}`);
+  }
+
+  return new Error(`AIによる${context}中に不明なエラーが発生しました。`);
 }
 
 export async function extractCarDataFromImages(base64Images: string[]): Promise<{ parsedData: CarSpecification[], rawJson: string }> {
@@ -86,8 +121,7 @@ export async function extractCarDataFromImages(base64Images: string[]): Promise<
       }
     });
 
-    // Add a 3-minute timeout to the API call
-    const response: GenerateContentResponse = await withTimeout(generateContentPromise, 180000);
+    const response: GenerateContentResponse = await withTimeout(generateContentPromise, 600000);
 
     const jsonText = response.text.trim();
     if (!jsonText) {
@@ -95,7 +129,6 @@ export async function extractCarDataFromImages(base64Images: string[]): Promise<
     }
     const parsedJson: Omit<CarSpecification, 'id'>[] = JSON.parse(jsonText);
     
-    // Add a unique ID for React keys
     const parsedData = parsedJson.map((item, index) => ({
       ...item,
       id: `${Date.now()}-${index}`
@@ -104,11 +137,7 @@ export async function extractCarDataFromImages(base64Images: string[]): Promise<
     return { parsedData, rawJson: jsonText };
 
   } catch (error) {
-    console.error("Error calling Gemini API:", error);
-    if (error instanceof Error && error.message.includes("timed out")) {
-        throw new Error("AIによるデータ抽出がタイムアウトしました。カタログが大きすぎるか、複雑すぎる可能性があります。");
-    }
-    throw new Error("AIによるデータ抽出に失敗しました。画像の品質が低いか、サポートされていない形式のカタログである可能性があります。");
+    throw handleGeminiError(error, '構造化データ抽出');
   }
 }
 
@@ -139,14 +168,10 @@ export async function extractRawTextFromImages(base64Images: string[]): Promise<
             contents,
         });
 
-        const response: GenerateContentResponse = await withTimeout(generateContentPromise, 180000);
+        const response: GenerateContentResponse = await withTimeout(generateContentPromise, 600000);
         return response.text.trim();
     } catch (error) {
-        console.error("Error calling Gemini API for raw text extraction:", error);
-        if (error instanceof Error && error.message.includes("timed out")) {
-            throw new Error("AIによるテキスト抽出がタイムアウトしました。");
-        }
-        throw new Error("AIによるテキスト抽出に失敗しました。");
+        throw handleGeminiError(error, 'テキスト抽出');
     }
 }
 
@@ -169,4 +194,33 @@ export function createChat(extractedData: CarSpecification[]): Chat {
     },
   });
   return chat;
+}
+
+export async function generateSummary(text: string): Promise<string> {
+  if (!text.trim()) {
+    return "要約対象のテキストがありません。";
+  }
+
+  const prompt = `
+    提供された自動車カタログのテキストから、以下の点を盛り込んだ簡潔な要約を300字から400字程度で作成してください。
+    - カタログ全体の概要
+    - 主な車種やアピールポイント
+    - ターゲットとしている顧客層
+    
+    出力は自然な日本語の文章にしてください。
+    ---
+    テキスト:
+    ${text}
+  `;
+
+  try {
+    const generateContentPromise = ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+    const response: GenerateContentResponse = await withTimeout(generateContentPromise, 120000); // 2 min timeout
+    return response.text.trim();
+  } catch (error) {
+    throw handleGeminiError(error, '要約生成');
+  }
 }

@@ -1,17 +1,25 @@
+
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { Chat } from '@google/genai';
 import { FileUpload } from './components/FileUpload';
 import { CarDataDisplay } from './components/CarDataDisplay';
 import { CatalogList } from './components/CatalogList';
 import { FilterControls } from './components/FilterControls';
-import { ChatPanel } from './components/ChatPanel';
-import { extractCarDataFromImages, createChat, extractRawTextFromImages } from './services/geminiService';
+import { ProgressTracker } from './components/ProgressTracker';
+import { extractCarDataFromImages, createChat, extractRawTextFromImages, generateSummary } from './services/geminiService';
 import { CarSpecification, CatalogRecord } from './types';
 import * as db from './db';
-import { LogoIcon, SparklesIcon } from './components/Icons';
+import { LogoIcon } from './components/Icons';
 
 // pdfjs-dist is loaded from CDN in index.html, so we can use the global object.
 declare const pdfjsLib: any;
+
+export type ProgressStep = 'idle' | 'reading' | 'converting' | 'extractingText' | 'extractingJson' | 'saving' | 'done' | 'error';
+export interface ProgressState {
+  step: ProgressStep;
+  error?: string;
+  completedSteps: Set<ProgressStep>;
+}
 
 interface Filters {
   manufacturer: string;
@@ -22,13 +30,10 @@ interface Filters {
 
 const App: React.FC = () => {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
-  const [extractedData, setExtractedData] = useState<CarSpecification[]>([]);
-  const [rawJsonOutput, setRawJsonOutput] = useState<string>('');
-  const [rawTextOutput, setRawTextOutput] = useState<string>('');
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isJsonLoading, setIsJsonLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const [statusMessage, setStatusMessage] = useState<string>('PDFをアップロードしてデータ抽出を開始します。');
+  const [progress, setProgress] = useState<ProgressState>({
+    step: 'idle',
+    completedSteps: new Set(),
+  });
   const [filters, setFilters] = useState<Filters>({
     manufacturer: '',
     modelName: '',
@@ -38,7 +43,9 @@ const App: React.FC = () => {
   const [chat, setChat] = useState<Chat | null>(null);
 
   const [savedCatalogs, setSavedCatalogs] = useState<CatalogRecord[]>([]);
-  const [selectedCatalogId, setSelectedCatalogId] = useState<number | null>(null);
+  const [selectedCatalog, setSelectedCatalog] = useState<CatalogRecord | null>(null);
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState<boolean>(false);
+  const selectedCatalogId = selectedCatalog?.id ?? null;
 
   useEffect(() => {
     db.initDB().then(loadCatalogs);
@@ -49,23 +56,36 @@ const App: React.FC = () => {
     setSavedCatalogs(catalogs);
   };
 
-  const handleSelectCatalog = (catalog: CatalogRecord) => {
-    setSelectedCatalogId(catalog.id);
+  const handleSelectCatalog = async (catalog: CatalogRecord) => {
     setPdfFile(null); // Clear file input state
-    setExtractedData(catalog.extractedData);
-    setRawJsonOutput(catalog.rawJson);
-    setRawTextOutput(catalog.rawText);
     setFilters({ manufacturer: '', modelName: '', issueDate: '', option: '' });
-    setError(null);
-    setIsLoading(false);
-    setIsJsonLoading(false);
+    setProgress({ step: 'idle', completedSteps: new Set() });
+
     if(catalog.extractedData.length > 0) {
       const newChat = createChat(catalog.extractedData);
       setChat(newChat);
-      setStatusMessage(`「${catalog.fileName}」のデータを表示中。`);
     } else {
       setChat(null);
-      setStatusMessage(`「${catalog.fileName}」には抽出された構造化データがありません。`);
+    }
+    
+    // Generate summary on-demand if it doesn't exist
+    if (!catalog.summary && catalog.rawText) {
+        setIsGeneratingSummary(true);
+        setSelectedCatalog(catalog); // Show existing data first
+        try {
+            const summary = await generateSummary(catalog.rawText);
+            const updatedCatalog = { ...catalog, summary };
+            await db.updateCatalog(updatedCatalog);
+            setSelectedCatalog(updatedCatalog); // Update state with summary
+            setSavedCatalogs(prev => prev.map(c => c.id === updatedCatalog.id ? updatedCatalog : c));
+        } catch(e) {
+            console.error("Failed to generate summary on demand:", e);
+            // On error, just proceed without a summary
+        } finally {
+            setIsGeneratingSummary(false);
+        }
+    } else {
+        setSelectedCatalog(catalog);
     }
   };
   
@@ -73,41 +93,43 @@ const App: React.FC = () => {
     await db.deleteCatalog(id);
     await loadCatalogs();
     if (selectedCatalogId === id) {
-      // Reset view if the deleted catalog was the selected one
-      setSelectedCatalogId(null);
-      setExtractedData([]);
-      setRawJsonOutput('');
-      setRawTextOutput('');
+      setSelectedCatalog(null);
       setChat(null);
-      setStatusMessage('カタログが削除されました。');
+      setProgress({ step: 'idle', completedSteps: new Set() });
     }
+  };
+
+  const resetStateForNewFile = () => {
+      setPdfFile(null);
+      setSelectedCatalog(null);
+      setFilters({ manufacturer: '', modelName: '', issueDate: '', option: '' });
+      setChat(null);
   };
 
   const handleFileChange = useCallback(async (file: File) => {
     if (!file) return;
+    
+    resetStateForNewFile();
     setPdfFile(file);
-    setSelectedCatalogId(null);
-    setExtractedData([]);
-    setRawJsonOutput('');
-    setRawTextOutput('');
-    setFilters({ manufacturer: '', modelName: '', issueDate: '', option: '' });
-    setError(null);
-    setIsLoading(true);
-    setChat(null);
-    setStatusMessage('PDFを処理中...');
+    setProgress({ step: 'reading', completedSteps: new Set() });
 
     try {
       const reader = new FileReader();
       reader.onload = async (event) => {
-        if (!event.target?.result) return;
+        if (!event.target?.result) {
+            setProgress({ step: 'error', error: 'PDFファイルの読み込みに失敗しました。', completedSteps: new Set() });
+            return;
+        }
+        
+        setProgress(prev => ({ ...prev, step: 'converting', completedSteps: new Set(prev.completedSteps).add('reading') }));
+
         const typedArray = new Uint8Array(event.target.result as ArrayBuffer);
         const pdf = await pdfjsLib.getDocument(typedArray).promise;
         const numPages = pdf.numPages;
         const imagePromises: Promise<string>[] = [];
-        setStatusMessage(`PDFの ${numPages} ページを画像に変換中...`);
         
         const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
+        const context = canvas.getContext('2d', { willReadFrequently: true });
 
         for (let i = 1; i <= numPages; i++) {
           const page = await pdf.getPage(i);
@@ -123,94 +145,114 @@ const App: React.FC = () => {
         canvas.remove();
         
         const images = await Promise.all(imagePromises);
-        setStatusMessage(`${numPages} ページの準備ができました。「データ抽出」をクリックしてください。`);
+        setProgress(prev => ({ ...prev, step: 'extractingText', completedSteps: new Set(prev.completedSteps).add('converting') }));
         await handleExtractData(images, file.name);
       };
       reader.readAsArrayBuffer(file);
     } catch (err) {
       console.error("PDF processing error:", err);
-      setError('PDFの処理中にエラーが発生しました。');
-      setStatusMessage('エラーが発生しました。もう一度お試しください。');
-      setIsLoading(false);
+      const errorMessage = err instanceof Error ? err.message : 'PDFの処理中にエラーが発生しました。';
+      setProgress({ step: 'error', error: errorMessage, completedSteps: new Set() });
     }
   }, []);
 
   const handleExtractData = async (images: string[], fileName: string) => {
     if (images.length === 0) {
-      setError('最初にPDFを処理してください。');
+      setProgress({ step: 'error', error: 'PDFから画像が抽出できませんでした。', completedSteps: new Set() });
       return;
     }
-    // Reset data states
-    setIsLoading(true);
-    setIsJsonLoading(true);
-    setError(null);
-    setExtractedData([]);
-    setRawJsonOutput('');
-    setRawTextOutput('');
-    setFilters({ manufacturer: '', modelName: '', issueDate: '', option: '' });
-    setChat(null);
-    setStatusMessage('AIによるデータ抽出を開始しました...');
-
-    const textPromise = extractRawTextFromImages(images);
-    const jsonPromise = extractCarDataFromImages(images);
 
     let extractedRawText = '';
     let extractedJsonData: { parsedData: CarSpecification[], rawJson: string } = { parsedData: [], rawJson: ''};
+    let summary: string | undefined = '';
+    const apiErrors: string[] = [];
 
     try {
-        setStatusMessage('AIがテキストを抽出中です...');
-        extractedRawText = await textPromise;
-        setRawTextOutput(extractedRawText);
-    } catch (err) {
-        console.error("Gemini API error (Text):", err);
-        setError(err instanceof Error ? err.message : 'AIによるテキスト抽出中に不明なエラーが発生しました。');
-    } finally {
-        setIsLoading(false);
-    }
+      const [textResult, jsonResult] = await Promise.allSettled([
+        extractRawTextFromImages(images),
+        extractCarDataFromImages(images),
+      ]);
 
-    try {
-        setStatusMessage('AIが構造化データを生成中です...');
-        extractedJsonData = await jsonPromise;
-        setExtractedData(extractedJsonData.parsedData);
-        setRawJsonOutput(extractedJsonData.rawJson);
+      if (textResult.status === 'fulfilled') {
+        extractedRawText = textResult.value;
+      } else {
+        apiErrors.push(textResult.reason instanceof Error ? textResult.reason.message : 'AIによるテキスト抽出中に不明なエラーが発生しました。');
+      }
 
+      if (jsonResult.status === 'fulfilled') {
+        extractedJsonData = jsonResult.value;
         if (extractedJsonData.parsedData.length > 0) {
             const newChat = createChat(extractedJsonData.parsedData);
             setChat(newChat);
         }
+      } else {
+        apiErrors.push(jsonResult.reason instanceof Error ? jsonResult.reason.message : 'AIによる構造化データ抽出中に不明なエラーが発生しました。');
+      }
+
+      if (apiErrors.length > 0) throw new Error(apiErrors.join('\n'));
+      
+      if (extractedRawText) {
+          try {
+              summary = await generateSummary(extractedRawText);
+          } catch (summaryError) {
+              console.error("Summary generation failed, but continuing:", summaryError);
+              // Do not block the whole process if only summary fails
+          }
+      }
+
     } catch (err) {
-        console.error("Gemini API error (JSON):", err);
-        const errorMessage = err instanceof Error ? err.message : 'AIによる構造化データ抽出中に不明なエラーが発生しました。';
-        setError(prev => prev ? `${prev}\n${errorMessage}` : errorMessage);
-    } finally {
-        setIsJsonLoading(false);
+      const errorMessage = err instanceof Error ? err.message : 'データ抽出中に予期せぬエラーが発生しました。';
+      setProgress(prev => ({ ...prev, step: 'error', error: errorMessage, completedSteps: prev.completedSteps }));
+      return;
+    }
+     
+    setProgress(prev => ({ ...prev, step: 'saving', completedSteps: new Set(prev.completedSteps).add('extractingText').add('extractingJson') }));
+
+    if (!extractedRawText && extractedJsonData.parsedData.length === 0) {
+      setProgress({ step: 'error', error: 'AIはカタログから有効なデータを抽出できませんでした。', completedSteps: new Set() });
+      return;
     }
      
     try {
-      setStatusMessage('抽出データをデータベースに保存中...');
-      const newCatalog = await db.saveCatalog({
+      const newCatalogData: Omit<CatalogRecord, 'id'> = {
         fileName,
         createdAt: new Date(),
         extractedData: extractedJsonData.parsedData,
         rawJson: extractedJsonData.rawJson,
         rawText: extractedRawText,
-      });
+        summary,
+        images,
+      };
+      const newCatalog = await db.saveCatalog(newCatalogData);
+      
       await loadCatalogs();
-      setSelectedCatalogId(newCatalog.id);
-      if (!error) {
-        setStatusMessage('データ抽出と保存が完了しました。');
-      } else {
-        setStatusMessage('一部エラーが発生しましたが、データは保存されました。');
-      }
+      setSelectedCatalog(newCatalog);
+      
+      setProgress(prev => ({ ...prev, step: 'done', completedSteps: new Set(prev.completedSteps).add('saving') }));
+      setTimeout(() => setProgress({ step: 'idle', completedSteps: new Set() }), 5000);
+
     } catch (dbError) {
       console.error('Failed to save to DB:', dbError);
-      setError(prev => prev ? `${prev}\nデータベースへの保存に失敗しました。` : 'データベースへの保存に失敗しました。');
-      setStatusMessage('データ抽出は完了しましたが、データベースへの保存に失敗しました。');
+      const errorMessage = dbError instanceof Error ? dbError.message : 'データベースへの保存に失敗しました。';
+      setProgress(prev => ({ ...prev, step: 'error', error: errorMessage, completedSteps: prev.completedSteps }));
     }
+  };
+  
+  const handleCellChange = (id: string, key: keyof CarSpecification, value: string | number | string[] | null) => {
+    if (!selectedCatalog) return;
+    
+    const updatedData = selectedCatalog.extractedData.map(item =>
+        item.id === id ? { ...item, [key]: value } : item
+    );
+    
+    setSelectedCatalog(prev => prev ? { ...prev, extractedData: updatedData } : null);
+    // Note: This change is temporary and not persisted to DB automatically.
+    // A "save" button could be added to persist changes via db.updateCatalog.
   };
 
   const filteredData = useMemo(() => {
-    return extractedData.filter(item => {
+    if (!selectedCatalog) return [];
+    return selectedCatalog.extractedData.filter(item => {
       const searchOption = filters.option.toLowerCase();
       return (
         (filters.manufacturer ? item.manufacturer === filters.manufacturer : true) &&
@@ -219,18 +261,10 @@ const App: React.FC = () => {
         (searchOption ? item.options && item.options.some(opt => opt.toLowerCase().includes(searchOption)) : true)
       );
     });
-  }, [extractedData, filters]);
+  }, [selectedCatalog, filters]);
   
-  const handleCellChange = (id: string, key: keyof CarSpecification, value: string | number | string[] | null) => {
-    setExtractedData(prevData =>
-      prevData.map(item =>
-        item.id === id ? { ...item, [key]: value } : item
-      )
-    );
-  };
-  
-  const hasData = extractedData.length > 0 || !!rawJsonOutput || !!rawTextOutput;
-  const isDisplayingData = !!selectedCatalogId || hasData;
+  const isProcessing = progress.step !== 'idle' && progress.step !== 'done';
+  const isDisplayingData = !!selectedCatalog || isProcessing;
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-200 font-sans">
@@ -252,9 +286,8 @@ const App: React.FC = () => {
           <aside className="lg:col-span-4 xl:col-span-3 space-y-6">
             <div className="bg-gray-800 rounded-lg p-6 shadow-lg">
               <h2 className="text-lg font-semibold mb-4">1. 新規カタログを追加</h2>
-              <FileUpload onFileSelect={handleFileChange} disabled={isLoading || isJsonLoading} />
-               <p className="text-sm text-gray-400 mt-4">{statusMessage}</p>
-               {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
+              <FileUpload onFileSelect={handleFileChange} disabled={isProcessing && progress.step !== 'error'} />
+              {isProcessing && <ProgressTracker progress={progress} />}
             </div>
             <CatalogList
               catalogs={savedCatalogs}
@@ -265,39 +298,22 @@ const App: React.FC = () => {
           </aside>
 
           <div className="lg:col-span-8 xl:col-span-9 space-y-6">
-             {isDisplayingData ? (
-              <>
-                {(extractedData.length > 0) &&
-                  <FilterControls
-                    data={extractedData}
-                    filters={filters}
-                    setFilters={setFilters}
-                  />
-                }
-                <CarDataDisplay
-                  data={filteredData}
-                  onCellChange={handleCellChange}
-                  isLoading={isLoading}
-                  isJsonLoading={isJsonLoading}
-                  hasAttemptedExtraction={true}
-                  originalDataLength={extractedData.length}
-                  rawJson={rawJsonOutput}
-                  rawText={rawTextOutput}
-                />
-                <ChatPanel chat={chat} />
-              </>
-            ) : (
-               <CarDataDisplay
-                data={[]}
-                onCellChange={() => {}}
-                isLoading={isLoading}
-                isJsonLoading={false}
-                hasAttemptedExtraction={false}
-                originalDataLength={0}
-                rawJson=""
-                rawText=""
+            {isDisplayingData && selectedCatalog && selectedCatalog.extractedData.length > 0 &&
+              <FilterControls
+                data={selectedCatalog.extractedData}
+                filters={filters}
+                setFilters={setFilters}
               />
-            )}
+            }
+             <CarDataDisplay
+                catalog={selectedCatalog}
+                chat={chat}
+                filteredData={filteredData}
+                onCellChange={handleCellChange}
+                isProcessing={isProcessing}
+                progress={progress}
+                isGeneratingSummary={isGeneratingSummary}
+              />
           </div>
         </div>
       </main>

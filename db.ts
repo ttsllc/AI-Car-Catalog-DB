@@ -1,7 +1,8 @@
+
 import { CatalogRecord } from './types';
 
 const DB_NAME = 'CarCatalogDB';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'catalogs';
 
 let db: IDBDatabase;
@@ -77,6 +78,23 @@ export const deleteCatalog = (id: number): Promise<void> => {
 
     request.onerror = () => {
       console.error('Error deleting catalog', request.error);
+      reject(request.error);
+    };
+  });
+};
+
+export const updateCatalog = (catalog: CatalogRecord): Promise<CatalogRecord> => {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.put(catalog); // .put() updates or inserts
+
+    request.onsuccess = () => {
+      resolve(catalog);
+    };
+
+    request.onerror = () => {
+      console.error('Error updating catalog', request.error);
       reject(request.error);
     };
   });
