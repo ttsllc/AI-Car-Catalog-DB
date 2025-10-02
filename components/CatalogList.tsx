@@ -1,6 +1,6 @@
 import React from 'react';
 import { CatalogRecord } from '../types';
-import { DatabaseIcon, TrashIcon } from './Icons';
+import { DatabaseIcon, TrashIcon, PhotoIcon } from './Icons';
 
 interface CatalogListProps {
   catalogs: CatalogRecord[];
@@ -30,11 +30,18 @@ export const CatalogList: React.FC<CatalogListProps> = ({ catalogs, selectedId, 
             <div
               key={catalog.id}
               onClick={() => onSelect(catalog)}
-              className={`flex justify-between items-center p-3 rounded-lg cursor-pointer transition-all duration-200 ${selectedId === catalog.id ? 'bg-cyan-500/20 ring-1 ring-cyan-500' : 'bg-gray-700/50 hover:bg-gray-700'}`}
+              className={`flex items-center p-3 rounded-lg cursor-pointer transition-all duration-200 ${selectedId === catalog.id ? 'bg-cyan-500/20 ring-1 ring-cyan-500' : 'bg-gray-700/50 hover:bg-gray-700'}`}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => e.key === 'Enter' && onSelect(catalog)}
             >
+              {catalog.images && catalog.images.length > 0 ? (
+                  <img src={catalog.images[0]} alt={catalog.fileName} className="w-16 h-12 object-cover rounded-md mr-4 flex-shrink-0 bg-gray-900" />
+              ) : (
+                  <div className="w-16 h-12 bg-gray-700 rounded-md mr-4 flex items-center justify-center flex-shrink-0">
+                      <PhotoIcon className="w-6 h-6 text-gray-500" />
+                  </div>
+              )}
               <div className="flex-1 overflow-hidden">
                 <p className={`font-semibold truncate ${selectedId === catalog.id ? 'text-cyan-300' : 'text-white'}`}>
                   {catalog.fileName}
