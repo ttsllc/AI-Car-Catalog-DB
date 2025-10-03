@@ -1,101 +1,98 @@
-
+import {
+  collection,
+  addDoc,
+  getDocs,
+  deleteDoc,
+  updateDoc,
+  doc,
+  query,
+  orderBy,
+  Timestamp
+} from 'firebase/firestore';
+import { db } from './firebase';
 import { CatalogRecord } from './types';
 
-const DB_NAME = 'CarCatalogDB';
-const DB_VERSION = 2;
-const STORE_NAME = 'catalogs';
-
-let db: IDBDatabase;
+const COLLECTION_NAME = 'catalogs';
 
 export const initDB = (): Promise<boolean> => {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-    request.onerror = () => {
-      console.error('Error opening DB', request.error);
-      reject(false);
-    };
-
-    request.onsuccess = () => {
-      db = request.result;
-      resolve(true);
-    };
-
-    request.onupgradeneeded = (event) => {
-      const db = (event.target as IDBOpenDBRequest).result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
-      }
-    };
-  });
+  // Firestore doesn't require explicit initialization
+  // Just return true to maintain compatibility with existing code
+  return Promise.resolve(true);
 };
 
-export const saveCatalog = (catalog: Omit<CatalogRecord, 'id'>): Promise<CatalogRecord> => {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.add(catalog);
+export const saveCatalog = async (catalog: Omit<CatalogRecord, 'id'>): Promise<CatalogRecord> => {
+  try {
+    const catalogsRef = collection(db, COLLECTION_NAME);
 
-    request.onsuccess = () => {
-      // Return the full record including the auto-generated ID
-      resolve({ ...catalog, id: request.result as number });
+    // Convert Date to Firestore Timestamp
+    const catalogData = {
+      ...catalog,
+      createdAt: Timestamp.fromDate(catalog.createdAt),
     };
 
-    request.onerror = () => {
-      console.error('Error saving catalog', request.error);
-      reject(request.error);
+    const docRef = await addDoc(catalogsRef, catalogData);
+
+    return {
+      ...catalog,
+      id: docRef.id as any, // Firestore uses string IDs, but we'll keep the type compatible
     };
-  });
+  } catch (error) {
+    console.error('Error saving catalog to Firestore:', error);
+    throw error;
+  }
 };
 
-export const getAllCatalogs = (): Promise<CatalogRecord[]> => {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.getAll();
+export const getAllCatalogs = async (): Promise<CatalogRecord[]> => {
+  try {
+    const catalogsRef = collection(db, COLLECTION_NAME);
+    const q = query(catalogsRef, orderBy('createdAt', 'desc'));
+    const querySnapshot = await getDocs(q);
 
-    request.onsuccess = () => {
-      // Sort by newest first
-      resolve(request.result.sort((a, b) => b.id - a.id));
-    };
+    const catalogs: CatalogRecord[] = [];
+    querySnapshot.forEach((doc) => {
+      const data = doc.data();
+      catalogs.push({
+        ...data,
+        id: doc.id as any, // Use Firestore document ID
+        createdAt: data.createdAt.toDate(), // Convert Timestamp back to Date
+      } as CatalogRecord);
+    });
 
-    request.onerror = () => {
-      console.error('Error getting all catalogs', request.error);
-      reject(request.error);
-    };
-  });
+    return catalogs;
+  } catch (error) {
+    console.error('Error getting catalogs from Firestore:', error);
+    throw error;
+  }
 };
 
-export const deleteCatalog = (id: number): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.delete(id);
-
-    request.onsuccess = () => {
-      resolve();
-    };
-
-    request.onerror = () => {
-      console.error('Error deleting catalog', request.error);
-      reject(request.error);
-    };
-  });
+export const deleteCatalog = async (id: number | string): Promise<void> => {
+  try {
+    const catalogRef = doc(db, COLLECTION_NAME, String(id));
+    await deleteDoc(catalogRef);
+  } catch (error) {
+    console.error('Error deleting catalog from Firestore:', error);
+    throw error;
+  }
 };
 
-export const updateCatalog = (catalog: CatalogRecord): Promise<CatalogRecord> => {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.put(catalog); // .put() updates or inserts
+export const updateCatalog = async (catalog: CatalogRecord): Promise<CatalogRecord> => {
+  try {
+    const catalogRef = doc(db, COLLECTION_NAME, String(catalog.id));
 
-    request.onsuccess = () => {
-      resolve(catalog);
+    // Convert Date to Firestore Timestamp
+    const catalogData = {
+      ...catalog,
+      createdAt: Timestamp.fromDate(catalog.createdAt),
     };
 
-    request.onerror = () => {
-      console.error('Error updating catalog', request.error);
-      reject(request.error);
-    };
-  });
+    // Remove the id field before updating (Firestore doesn't store the document ID in the document)
+    const { id, ...dataToUpdate } = catalogData;
+
+    await updateDoc(catalogRef, dataToUpdate);
+
+    return catalog;
+  } catch (error) {
+    console.error('Error updating catalog in Firestore:', error);
+    throw error;
+  }
 };
