@@ -2,11 +2,13 @@
 import { GoogleGenAI, Type, GenerateContentResponse, Chat } from "@google/genai";
 import { CarSpecification } from '../types';
 
-if (!process.env.API_KEY) {
-  throw new Error("API_KEY environment variable not set");
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.GEMINI_API_KEY;
+
+if (!apiKey) {
+  throw new Error("GEMINI_API_KEY environment variable not set");
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const ai = new GoogleGenAI({ apiKey });
 
 const carDataSchema = {
   type: Type.ARRAY,
@@ -169,7 +171,14 @@ export async function extractRawTextFromImages(base64Images: string[]): Promise<
         });
 
         const response: GenerateContentResponse = await withTimeout(generateContentPromise, 600000);
-        return response.text.trim();
+        const text = response?.text;
+
+        if (!text) {
+            console.warn('Empty response from Gemini API for text extraction');
+            return '';
+        }
+
+        return text.trim();
     } catch (error) {
         throw handleGeminiError(error, 'テキスト抽出');
     }
@@ -206,7 +215,7 @@ export async function generateSummary(text: string): Promise<string> {
     - カタログ全体の概要
     - 主な車種やアピールポイント
     - ターゲットとしている顧客層
-    
+
     出力は自然な日本語の文章にしてください。
     ---
     テキスト:
@@ -222,5 +231,77 @@ export async function generateSummary(text: string): Promise<string> {
     return response.text.trim();
   } catch (error) {
     throw handleGeminiError(error, '要約生成');
+  }
+}
+
+/**
+ * Extract car catalog data from web page HTML content
+ */
+export async function extractCarDataFromWebPage(htmlContent: string, url: string): Promise<{ parsedData: CarSpecification[], rawJson: string, rawText: string }> {
+  const prompt = `
+    あなたは自動車データ分析の専門家です。
+    提供されたWebページのHTML/テキストコンテンツから、自動車カタログ情報を抽出してください。
+
+    URL: ${url}
+
+    以下の情報を抽出してください：
+    - メーカー名
+    - 車種名
+    - グレード
+    - 価格
+    - 発行年月（掲載日や更新日から推測）
+    - エンジンタイプ、排気量、出力、トルク
+    - 燃費
+    - 主なオプション装備
+
+    出力は指定されたJSONスキーマに厳密に従ってください。
+    見つからない項目はnullとしてください。
+
+    ---
+    コンテンツ:
+    ${htmlContent.slice(0, 50000)} // Limit content size
+  `;
+
+  try {
+    // Extract structured data
+    const structuredPromise = ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: carDataSchema,
+      }
+    });
+
+    const structuredResponse: GenerateContentResponse = await withTimeout(structuredPromise, 600000);
+    const jsonText = structuredResponse.text?.trim() || '[]';
+    const parsedJson: Omit<CarSpecification, 'id'>[] = JSON.parse(jsonText);
+
+    const parsedData = parsedJson.map((item, index) => ({
+      ...item,
+      id: `${Date.now()}-${index}`
+    }));
+
+    // Extract raw text
+    const textPrompt = `
+      以下のWebページコンテンツから、自動車カタログに関連するすべてのテキスト情報を抽出してください。
+      ナビゲーション、広告、フッターなどの不要な情報は除外してください。
+
+      ---
+      ${htmlContent.slice(0, 50000)}
+    `;
+
+    const textPromise = ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: textPrompt,
+    });
+
+    const textResponse: GenerateContentResponse = await withTimeout(textPromise, 600000);
+    const rawText = textResponse.text?.trim() || '';
+
+    return { parsedData, rawJson: jsonText, rawText };
+
+  } catch (error) {
+    throw handleGeminiError(error, 'Webページからのデータ抽出');
   }
 }

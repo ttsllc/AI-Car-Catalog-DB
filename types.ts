@@ -22,12 +22,13 @@ export interface ChatMessage {
 }
 
 export interface CatalogRecord {
-  id: number;
+  id: number | string;
   fileName: string;
   createdAt: Date;
   extractedData: CarSpecification[];
   rawJson: string;
   rawText: string;
   summary?: string;
-  images?: string[];
+  images?: string[]; // Array of image URLs from Firebase Storage
+  imageUrls?: string[]; // Deprecated, use images instead
 }

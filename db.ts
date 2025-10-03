@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import { db } from './firebase';
 import { CatalogRecord } from './types';
+import { uploadImagesToStorage } from './services/storageService';
 
 const COLLECTION_NAME = 'catalogs';
 
@@ -24,9 +25,19 @@ export const saveCatalog = async (catalog: Omit<CatalogRecord, 'id'>): Promise<C
   try {
     const catalogsRef = collection(db, COLLECTION_NAME);
 
-    // Convert Date to Firestore Timestamp
+    // Generate a unique catalog ID
+    const catalogId = `catalog-${Date.now()}`;
+
+    // Upload images to Firebase Storage if they exist
+    let imageUrls: string[] = [];
+    if (catalog.images && catalog.images.length > 0) {
+      imageUrls = await uploadImagesToStorage(catalog.images, catalogId);
+    }
+
+    // Convert Date to Firestore Timestamp and replace base64 images with URLs
     const catalogData = {
       ...catalog,
+      images: imageUrls, // Replace base64 images with Storage URLs
       createdAt: Timestamp.fromDate(catalog.createdAt),
     };
 
@@ -34,6 +45,7 @@ export const saveCatalog = async (catalog: Omit<CatalogRecord, 'id'>): Promise<C
 
     return {
       ...catalog,
+      images: imageUrls,
       id: docRef.id as any, // Firestore uses string IDs, but we'll keep the type compatible
     };
   } catch (error) {

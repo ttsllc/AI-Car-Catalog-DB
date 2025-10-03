@@ -2,11 +2,13 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { Chat } from '@google/genai';
 import { FileUpload } from './components/FileUpload';
+import { UrlInput } from './components/UrlInput';
 import { CarDataDisplay } from './components/CarDataDisplay';
 import { CatalogList } from './components/CatalogList';
 import { FilterControls } from './components/FilterControls';
 import { ProgressTracker } from './components/ProgressTracker';
-import { extractCarDataFromImages, createChat, extractRawTextFromImages, generateSummary } from './services/geminiService';
+import { extractCarDataFromImages, createChat, extractRawTextFromImages, generateSummary, extractCarDataFromWebPage } from './services/geminiService';
+import { fetchWebPageContent } from './services/webScraperService';
 import { CarSpecification, CatalogRecord } from './types';
 import * as db from './db';
 import { LogoIcon } from './components/Icons';
@@ -133,13 +135,13 @@ const App: React.FC = () => {
 
         for (let i = 1; i <= numPages; i++) {
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: 1.5 });
+          const viewport = page.getViewport({ scale: 1.0 }); // Reduced from 1.5 to 1.0
           canvas.height = viewport.height;
           canvas.width = viewport.width;
 
           if (context) {
             await page.render({ canvasContext: context, viewport: viewport }).promise;
-            imagePromises.push(Promise.resolve(canvas.toDataURL('image/jpeg', 0.85)));
+            imagePromises.push(Promise.resolve(canvas.toDataURL('image/jpeg', 0.75))); // Balanced quality: readable but smaller
           }
         }
         canvas.remove();
@@ -238,13 +240,67 @@ const App: React.FC = () => {
     }
   };
   
+  const handleUrlSubmit = async (url: string) => {
+    resetStateForNewFile();
+    setProgress({ step: 'reading', completedSteps: new Set() });
+
+    try {
+      // Fetch web page content
+      const htmlContent = await fetchWebPageContent(url);
+      setProgress(prev => ({ ...prev, step: 'extractingJson', completedSteps: new Set(prev.completedSteps).add('reading') }));
+
+      // Extract data using Gemini
+      const { parsedData, rawJson, rawText } = await extractCarDataFromWebPage(htmlContent, url);
+
+      if (parsedData.length > 0) {
+        const newChat = createChat(parsedData);
+        setChat(newChat);
+      }
+
+      setProgress(prev => ({ ...prev, step: 'saving', completedSteps: new Set(prev.completedSteps).add('extractingJson') }));
+
+      // Generate summary
+      let summary: string | undefined = '';
+      if (rawText) {
+        try {
+          summary = await generateSummary(rawText);
+        } catch (summaryError) {
+          console.error("Summary generation failed, but continuing:", summaryError);
+        }
+      }
+
+      // Save to database (no images for URL-based catalogs)
+      const newCatalogData: Omit<CatalogRecord, 'id'> = {
+        fileName: new URL(url).hostname,
+        createdAt: new Date(),
+        extractedData: parsedData,
+        rawJson,
+        rawText,
+        summary,
+        images: [], // No images for web-based catalogs
+      };
+
+      const newCatalog = await db.saveCatalog(newCatalogData);
+      await loadCatalogs();
+      setSelectedCatalog(newCatalog);
+
+      setProgress(prev => ({ ...prev, step: 'done', completedSteps: new Set(prev.completedSteps).add('saving') }));
+      setTimeout(() => setProgress({ step: 'idle', completedSteps: new Set() }), 5000);
+
+    } catch (error) {
+      console.error('URL processing error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'URLからのデータ取得中にエラーが発生しました。';
+      setProgress({ step: 'error', error: errorMessage, completedSteps: new Set() });
+    }
+  };
+
   const handleCellChange = (id: string, key: keyof CarSpecification, value: string | number | string[] | null) => {
     if (!selectedCatalog) return;
-    
+
     const updatedData = selectedCatalog.extractedData.map(item =>
         item.id === id ? { ...item, [key]: value } : item
     );
-    
+
     setSelectedCatalog(prev => prev ? { ...prev, extractedData: updatedData } : null);
     // Note: This change is temporary and not persisted to DB automatically.
     // A "save" button could be added to persist changes via db.updateCatalog.
@@ -286,8 +342,25 @@ const App: React.FC = () => {
           <aside className="lg:col-span-4 xl:col-span-3 space-y-6">
             <div className="bg-gray-800 rounded-lg p-6 shadow-lg">
               <h2 className="text-lg font-semibold mb-4">1. 新規カタログを追加</h2>
-              <FileUpload onFileSelect={handleFileChange} disabled={isProcessing && progress.step !== 'error'} />
-              {isProcessing && <ProgressTracker progress={progress} />}
+              <div className="space-y-4">
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-2">PDFをアップロード</h3>
+                  <FileUpload onFileSelect={handleFileChange} disabled={isProcessing && progress.step !== 'error'} />
+                </div>
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-gray-600"></div>
+                  </div>
+                  <div className="relative flex justify-center text-sm">
+                    <span className="px-2 bg-gray-800 text-gray-400">または</span>
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-gray-400 mb-2">WebページのURL</h3>
+                  <UrlInput onUrlSubmit={handleUrlSubmit} disabled={isProcessing && progress.step !== 'error'} />
+                </div>
+              </div>
+              {isProcessing && <div className="mt-4"><ProgressTracker progress={progress} /></div>}
             </div>
             <CatalogList
               catalogs={savedCatalogs}
