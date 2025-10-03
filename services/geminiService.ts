@@ -5,7 +5,8 @@ import { CarSpecification } from '../types';
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.GEMINI_API_KEY;
 
 if (!apiKey) {
-  throw new Error("GEMINI_API_KEY environment variable not set");
+  console.error("Available env vars:", import.meta.env);
+  throw new Error("VITE_GEMINI_API_KEY environment variable not set. Please add it to Vercel Environment Variables.");
 }
 
 const ai = new GoogleGenAI({ apiKey });
